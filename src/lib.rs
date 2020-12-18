@@ -3,38 +3,105 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::collections::VecDeque;
 
 pub struct Sender<T> {
-  inner: Arc<Inner<T>>,
+  shared: Arc<Shared<T>>,
 }
+
+/**
+ * Need to have Sender be cloneable, but #[derive(Clone)] doesn't work,
+ * as it desugars to:
+ * impl<T: Clone> Clone for Sender<T> {
+ *  fn clone(&self) -> Self {
+ *    // ....
+ * }
+ * } 
+ *  which adds the Clone bound to T as well.
+ * In our case, Arc implements Clone even if T doesn't implement Clone
+ * 
+*/
+
+impl<T> Clone for Sender<T> {
+  fn clone(&self) -> Self {
+    // cus we're keeping track of # of senders,
+    // we need to update the count when cloning
+    let mut inner = self.shared.inner.lock().unwrap();
+    inner.senders += 1;
+    drop(inner);
+
+
+    Sender {
+      // dont do this
+      // shared: self.shared.clone(),
+      // we do this to say we want to clone the Arc, 
+      // not the thing inside
+      shared: Arc::clone(&self.shared),
+    }
+  }
+}
+
+impl<T> Drop for Sender<T> {
+  fn drop(&mut self) {
+    let mut inner = self.shared.inner.lock().unwrap();
+    inner.senders -= 1;
+    let was_last = inner.senders == 0;
+    drop(inner);
+    if was_last {  
+      self.shared.available.notify_one();
+    }
+  }
+}
+
 
 impl<T> Sender<T> {
   pub fn send(&mut self, t: T) {
     // Note the thing about the poisoned lock
-    let mut queue = self.inner.queue.lock().unwrap();
-    queue.push_back(t);
+    let mut inner = self.shared.inner.lock().unwrap();
+    inner.queue.push_back(t);
     // drop the lock so that whoever we notify can wake up immediately,
     // and we notify one thread
-    drop(queue);
-    self.inner.available.notify_one();
+    drop(inner);
+    self.shared.available.notify_one();
   }
 }
 
 // Needs a mutex cus a send and recv can happen at the same time
 pub struct Receiver<T> {
-  inner: Arc<Inner<T>>,
+  shared: Arc<Shared<T>>,
+  buffer: VecDeque<T>,
 }
 
 impl<T> Receiver<T> {
   // We're implementing a blocking receive, where
   // if there's nothing yet, it waits to receive something
   // unlike a try_recv, which would return Option<T>
-  pub fn recv(&mut self) -> T {
-    let mut queue = self.inner.queue.lock().unwrap();
+  // Note: while trying to deal with the 0 senders case,
+  // we do end up needing an Option<T> cus it can be none
+  // if a Receiver is still blocking while senders r gone
+  pub fn recv(&mut self) -> Option<T> {
+    // for batch recv optimization: *
+    // if there's some leftover items from the last time we took the lock
+    if let Some(t) = self.buffer.pop_front() {
+      return Some(t)
+    }
+    let mut inner = self.shared.inner.lock().unwrap();
     loop {
-      match queue.pop_front() {
-        Some(t) => return t, // return drops the mutex btw
+      match inner.queue.pop_front() {
+        // return drops the mutex btw
+        Some(t) => {
+          // for batch recv optimization: *
+          // we only have 1 receiver, so anytime we do get the lock,
+          // might as well pick off everything from the queue at once
+          if !inner.queue.is_empty() {
+            // swap that vedeque w this new vecdeque
+            std::mem::swap(&mut self.buffer, &mut inner.queue)
+          }
+          return Some(t)
+        }
+        // None if dbg!(inner.senders) == 0 => return None,
+        None if inner.senders == 0 => return None,
         None => {
+          // only if # of senders > 0 do we end up here
           // have to give up mutex when waiting
-          queue = self.inner.available.wait(queue).unwrap();
+          inner = self.shared.available.wait(inner).unwrap();
         }
       }
     }
@@ -42,35 +109,95 @@ impl<T> Receiver<T> {
 }
 
 
+impl<T> Iterator for Receiver<T> {
+  type Item = T;
+  
+  fn next(&mut self) -> Option<Self::Item> {
+    self.recv()
+  }
+
+}
+
+struct Inner<T> {
+  queue: VecDeque<T>,
+  senders: usize,
+}
+
 // common thing in rust when multiple handles 
 // that point to the same thing
-// the inner type holds the data that is shared
+// the shared (inner) type holds the data that is shared
 // we use Mutex over a boolean semaphore bc
 //  - semaphore would have to spin on the condition,
 //    but Mutex's sleep/awake will be handled by the OS
-struct Inner<T> {
+struct Shared<T> {
   // receiver deal with the oldest message on channel first
-  queue: Mutex<VecDeque<T>>,
+  inner: Mutex<Inner<T>>,
   // condvar has to be outside the mutex btw, so sleeping 
   // threads can wake
   available: Condvar,
 }
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-  let inner = Inner { 
-    queue: Mutex::default(), 
-    available: Condvar::default()
+  let inner = Inner {
+    queue: VecDeque::default(),
+    senders: 1,
   };
-  // shared inner
-  let inner = Arc::new(inner);
 
-  // return a (sender, receiver) of that inner
+  let shared = Shared { 
+    inner: Mutex::new(inner), 
+    available: Condvar::new()
+  };
+  // shared 
+  let shared = Arc::new(shared);
+
+  // return a (sender, receiver) of that shared
   (
     Sender {
-      inner: inner.clone(),
+      shared: shared.clone(),
     },
     Receiver {
-      inner: inner.clone(),
+      shared: shared.clone(),
+      buffer: VecDeque::default(),
     }
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn ping_pong() {
+    let (mut tx, mut rx) = channel();
+    tx.send(42);
+    assert_eq!(rx.recv(), Some(42))
+  }
+
+  // this hangs
+  // need a way to tell receivers that all
+  // senders are closed
+  #[test]
+  fn closed_tx() {
+    let (tx, mut rx) = channel::<()>();
+    // doesnt drop tx for some reason
+    // let _ = tx;
+    drop(tx);
+    assert_eq!(rx.recv(), None);
+  }
+  
+  #[test]
+  fn closed_rx() {
+    let (_tx, rx) = channel::<()>();
+    drop(rx);
+    // tx.send(42);
+  }
+
+  #[test]
+  fn play() {
+    let (mut tx, mut rx) = channel();
+
+    tx.send(10);
+    assert_eq!(rx.recv(), Some(10));
+  }
+
 }
