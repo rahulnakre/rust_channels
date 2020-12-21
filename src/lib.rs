@@ -1,6 +1,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 // Vector with head and tail pointer
 use std::collections::VecDeque;
+use std::thread;
 
 pub struct Sender<T> {
   shared: Arc<Shared<T>>,
@@ -195,9 +196,30 @@ mod tests {
   #[test]
   fn play() {
     let (mut tx, mut rx) = channel();
-
     tx.send(10);
     assert_eq!(rx.recv(), Some(10));
   }
+
+  #[test]
+  fn play2() {
+    let (tx, rx): (Sender<i32>, Receiver<i32>) = channel();  
+    let mut children = Vec::new();
+    static NTHREADS: i32 = 30;
+
+    for id in 0..NTHREADS {
+      let mut thread_tx = tx.clone();
+
+      let child = thread::spawn(move || {
+        thread_tx.send(id);
+
+        println!("Thread {} done", id);
+      });
+
+      children.push(child);
+    }
+
+
+  }
+
 
 }
