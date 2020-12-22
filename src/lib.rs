@@ -1,7 +1,12 @@
+#![feature(test)]
+
 use std::sync::{Arc, Condvar, Mutex};
 // Vector with head and tail pointer
 use std::collections::VecDeque;
 use std::thread;
+use std::sync::mpsc;
+
+extern crate test;
 
 pub struct Sender<T> {
   shared: Arc<Shared<T>>,
@@ -166,6 +171,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use test::Bencher;
 
   #[test]
   fn ping_pong() {
@@ -193,17 +199,36 @@ mod tests {
     // tx.send(42);
   }
 
-  #[test]
-  fn play() {
+  fn my_channel_send_main() {
     let (mut tx, mut rx) = channel();
     tx.send(10);
-    assert_eq!(rx.recv(), Some(10));
+    // assert_eq!(rx.recv(), Some(10));
   }
 
-  #[test]
-  fn play2() {
-    // let (tx, rx): (Sender<i32>, Receiver<i32>) = channel();  
-    let (tx, mut rx) = channel();  
+  #[bench]
+  fn my_channel_send(b: &mut Bencher) {
+    b.iter(|| {
+      my_channel_send_main();
+    });
+  }
+
+  fn mpsc_channel_send_main() {
+    let (tx, rx) = mpsc::channel();
+    tx.send(10);
+    // assert_eq!(rx.recv(), Some(10));
+  }
+
+  #[bench]
+  fn mpsc_channel_send(b: &mut Bencher) {
+    b.iter(|| {
+      mpsc_channel_send_main();
+    });
+  }
+
+
+
+  fn play2_main() {
+    let (tx, mut rx): (Sender<i32>, Receiver<i32>) = channel();  
     let mut children = Vec::new();
     static NTHREADS: i32 = 30;
 
@@ -231,7 +256,24 @@ mod tests {
 
     println!("{:?}", ids);
 
+    // messages collected
+    let mut ids = Vec::with_capacity(NTHREADS as usize);
+    for _ in 0..NTHREADS {
+      ids.push(rx.recv());
+    }
 
+    for child in children {
+      child.join().expect("child thread panicked");
+    }
+
+    println!("{:?}", ids);
+  }
+
+  #[bench]
+  fn play2(b: &mut Bencher) {
+    b.iter(|| {
+      play2_main();
+    })
   }
 
 
